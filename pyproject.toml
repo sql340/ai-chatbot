@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-chatbot"
+version = "0.1.0"
+description = "DeepAgents-based customer service chatbot"
+readme = "README.md"
+requires-python = ">=3.11,<4"
+dependencies = [
+  "deepagents==0.7.32",
+  "fastapi>=0.115",
+  "httpx>=0.28",
+  "langchain-openai>=1.0",
+  "pydantic-settings>=2.7",
+  "python-dotenv>=1.0",
+  "redis>=5.2",
+  "uvicorn[standard]>=0.34",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
