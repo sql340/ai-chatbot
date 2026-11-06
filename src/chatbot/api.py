@@ -4,12 +4,28 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
+from fastapi.staticfiles import StaticFiles
 
 from .agent import build_agent
+from .channels import (
+    ChannelAuthError,
+    ChannelHttpRequest,
+    ChannelPayloadError,
+    build_channel_registry,
+)
+from .channels.dispatcher import ChannelDispatcher
+from .channels.state import build_channel_binding_store, build_event_deduplicator
 from .config import Settings
 from .knowledge import build_knowledge_provider
 from .locks import SessionBusyError, build_lock_manager
@@ -61,9 +77,24 @@ def create_app(
 
         app.state.settings = resolved_settings
         app.state.service = runtime
+        bindings = build_channel_binding_store(resolved_settings)
+        deduplicator = build_event_deduplicator(resolved_settings)
+        channels = build_channel_registry(resolved_settings)
+        app.state.channel_bindings = bindings
+        app.state.channel_deduplicator = deduplicator
+        app.state.channels = channels
+        app.state.channel_dispatcher = ChannelDispatcher(
+            service=runtime,
+            bindings=bindings,
+            deduplicator=deduplicator,
+            settings=resolved_settings,
+        )
         try:
             yield
         finally:
+            await channels.close()
+            await bindings.close()
+            await deduplicator.close()
             await runtime.close()
 
     app = FastAPI(title=resolved_settings.app_name, version="0.1.0", lifespan=lifespan)
@@ -77,9 +108,79 @@ def create_app(
             allow_headers=["*"],
         )
 
+    static_dir = Path(__file__).with_name("static")
+    if resolved_settings.web_enabled and static_dir.is_dir():
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+        @app.get("/", include_in_schema=False)
+        async def web_ui() -> FileResponse:
+            return FileResponse(
+                static_dir / "index.html",
+                headers={"Cache-Control": "no-cache"},
+            )
+
     @app.get("/health")
     async def health(request: Request) -> dict:
         return await _service(request).health()
+
+    @app.get(
+        "/v1/channels/{channel}/events",
+        name="receive_channel_event_get",
+        operation_id="receive_channel_event_get",
+    )
+    @app.post(
+        "/v1/channels/{channel}/events",
+        name="receive_channel_event_post",
+        operation_id="receive_channel_event_post",
+    )
+    async def channel_event(
+        channel: str,
+        request: Request,
+        background_tasks: BackgroundTasks,
+    ) -> Response:
+        adapter = _channels(request).get(channel)
+        if adapter is None:
+            raise HTTPException(status_code=404, detail="channel is not enabled")
+
+        channel_request = ChannelHttpRequest(
+            method=request.method,
+            headers={key.lower(): value for key, value in request.headers.items()},
+            query=dict(request.query_params),
+            body=await request.body(),
+        )
+        try:
+            result = await adapter.receive(channel_request)
+        except ChannelAuthError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ChannelPayloadError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if result.message is None:
+            return _channel_response(result.response, result.status_code, result.media_type)
+
+        if result.process_async:
+            background_tasks.add_task(
+                _channel_dispatcher(request).process_and_send,
+                adapter,
+                result.message,
+            )
+            return _channel_response(result.response, result.status_code, result.media_type)
+
+        try:
+            response = await _channel_dispatcher(request).handle(result.message)
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="session not found or expired") from exc
+        except SessionForbiddenError as exc:
+            raise HTTPException(status_code=403, detail="session does not belong to this user") from exc
+        except SessionClosedError as exc:
+            raise HTTPException(status_code=409, detail="session is closed or handed off") from exc
+        except SessionBusyError as exc:
+            raise HTTPException(status_code=409, detail="session is busy") from exc
+        except AgentInvocationError as exc:
+            raise HTTPException(status_code=502, detail="agent invocation failed") from exc
+        if response is None:
+            return Response(status_code=204)
+        return JSONResponse(content=response.model_dump(mode="json"))
 
     @app.post("/v1/chat", response_model=ChatResponse)
     async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
@@ -144,9 +245,25 @@ def _service(request: Request) -> ChatService:
     return request.app.state.service
 
 
+def _channels(request: Request):
+    return request.app.state.channels
+
+
+def _channel_dispatcher(request: Request) -> ChannelDispatcher:
+    return request.app.state.channel_dispatcher
+
+
 def _sse(event: str, data: dict) -> str:
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return f"event: {event}\ndata: {payload}\n\n"
+
+
+def _channel_response(payload: object, status_code: int, media_type: str) -> Response:
+    if isinstance(payload, dict):
+        return JSONResponse(payload, status_code=status_code)
+    if payload is None:
+        return Response(status_code=status_code, media_type=media_type)
+    return PlainTextResponse(str(payload), status_code=status_code, media_type=media_type)
 
 
 __all__ = ["create_app"]

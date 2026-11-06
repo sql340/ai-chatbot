@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#171914" />
+    <title>在线支持台</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23171914'/%3E%3Ccircle cx='32' cy='32' r='19' fill='none' stroke='%23ef5b34' stroke-width='3'/%3E%3Cpath d='M24 20v24M40 20v24M24 32h16' stroke='%23faf7ef' stroke-width='3'/%3E%3C/svg%3E"
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,500;9..144,650&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+    <main class="shell">
+      <aside class="rail">
+        <div class="brand">
+          <span class="eyebrow">SUPPORT DESK / 01</span>
+          <h1>在线支持台</h1>
+          <p>把问题说清楚，接下来的步骤交给我。</p>
+        </div>
+
+        <div class="rail-meta">
+          <div class="status-line" role="status" aria-live="polite">
+            <span class="status-dot" id="connectionDot"></span>
+            <span id="connectionText">正在连接服务</span>
+          </div>
+          <div class="meta-row">
+            <span>渠道</span>
+            <code>WEB / 网页组件</code>
+          </div>
+          <div class="meta-row">
+            <span>身份</span>
+            <code id="identityLabel">载入中</code>
+          </div>
+          <div class="meta-row">
+            <span>会话</span>
+            <code id="sessionLabel">尚未开始</code>
+          </div>
+        </div>
+
+        <div class="rail-actions">
+          <label class="switch-row" for="streamToggle">
+            <span>
+              <strong>流式回复</strong>
+              <small>边生成边显示，适合网页</small>
+            </span>
+            <input id="streamToggle" type="checkbox" checked />
+            <span class="switch" aria-hidden="true"></span>
+          </label>
+          <button class="text-button" id="newSessionButton" type="button">建立新会话 <span>↗</span></button>
+          <button class="text-button" id="editIdentityButton" type="button">切换测试身份 <span>↗</span></button>
+        </div>
+
+        <div class="rail-foot">
+          <span class="seal">H</span>
+          <p>此页面仅用于本地联调。生产环境请由企业网关完成登录鉴权，并覆盖租户与用户身份。</p>
+        </div>
+      </aside>
+
+      <section class="stage" aria-label="客服聊天">
+        <header class="stage-head">
+          <div>
+            <span class="eyebrow">LIVE CONVERSATION</span>
+            <h2>有什么可以帮你？</h2>
+          </div>
+          <div class="stage-state" id="stageState"><span></span> 可对话</div>
+        </header>
+
+        <div class="messages" id="messages" role="log" aria-live="polite" aria-relevant="additions text">
+          <div class="empty-state" id="emptyState">
+            <p class="empty-kicker">从这里开始</p>
+            <h3>订单、退款、发票，或者只是一句“帮我看看”。</h3>
+            <p>问题不完整也没关系，我会先确认最关键的信息。</p>
+            <div class="suggestions" aria-label="示例问题">
+              <button type="button" data-suggestion="我想查一下最近的订单">查最近订单</button>
+              <button type="button" data-suggestion="退款一般多久能到账？">退款时效</button>
+              <button type="button" data-suggestion="我要开一张发票">申请发票</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="composer-wrap">
+          <div class="notice" id="notice" role="status" aria-live="polite" hidden></div>
+          <form class="composer" id="composer">
+            <label class="sr-only" for="messageInput">输入消息</label>
+            <textarea
+              id="messageInput"
+              rows="1"
+              maxlength="8000"
+              placeholder="输入你的问题…"
+              autocomplete="off"
+            ></textarea>
+            <div class="composer-actions">
+              <button class="stop-button" id="stopButton" type="button" hidden>停止</button>
+              <button class="send-button" id="sendButton" type="submit">
+                <span id="sendLabel">发送</span>
+                <span class="send-arrow" aria-hidden="true">↗</span>
+              </button>
+            </div>
+          </form>
+          <p class="composer-hint">Enter 发送 · Shift + Enter 换行 · 单次回复会按语义拆分</p>
+        </div>
+      </section>
+    </main>
+
+    <dialog class="identity-dialog" id="identityDialog">
+      <form id="identityForm" method="dialog">
+        <span class="eyebrow">TEST IDENTITY</span>
+        <h2>设置联调身份</h2>
+        <p>仅用于本地演示。生产环境应移除此入口，由网关注入可信身份。</p>
+        <label for="tenantInput">租户 ID</label>
+        <input id="tenantInput" name="tenant_id" maxlength="64" required pattern="[A-Za-z0-9._-]+" />
+        <label for="userInput">用户 ID</label>
+        <input id="userInput" name="user_id" maxlength="128" required />
+        <div class="dialog-actions">
+          <button class="text-button" id="cancelIdentity" type="button">取消</button>
+          <button class="send-button" type="submit">应用并新建会话</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
