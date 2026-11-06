@@ -172,6 +172,7 @@ QQ_ENABLED=true
 QQ_TENANT_ID=acme
 QQ_ONEBOT_API_BASE_URL=http://127.0.0.1:3000
 QQ_ONEBOT_ACCESS_TOKEN=optional-token
+QQ_ONEBOT_WEBHOOK_SECRET=optional-webhook-secret
 ```
 
 将 OneBot 的 HTTP 事件上报地址配置为：
@@ -180,7 +181,14 @@ QQ_ONEBOT_ACCESS_TOKEN=optional-token
 http://<chatbot-host>:8000/v1/channels/qq/events
 ```
 
-同时开启 HTTP API，并保证 `QQ_ONEBOT_API_BASE_URL` 指向该 API。服务通过 `send_private_msg` 和 `send_group_msg` 回复；群聊按 `group:<group_id>:<user_id>` 维护独立会话。配置 `QQ_ONEBOT_ACCESS_TOKEN` 时，接收回调校验 `Authorization: Bearer ...`，调用 OneBot API 也会带上该请求头。
+同时开启 HTTP API，并保证 `QQ_ONEBOT_API_BASE_URL` 指向该 API。服务通过 `send_private_msg` 和 `send_group_msg` 回复；群聊按 `group:<group_id>:<user_id>` 维护独立会话。
+
+两个密钥用途不同：
+
+- `QQ_ONEBOT_ACCESS_TOKEN`：服务调用 OneBot HTTP API 时使用的 access token，对应 OneBot 配置的 `access_token`，请求会带 `Authorization: Bearer ...`。
+- `QQ_ONEBOT_WEBHOOK_SECRET`：OneBot 向聊天服务上报事件时使用的签名 secret，对应 HTTP 客户端配置的 `secret`。配置后服务会按 OneBot 11 规范校验 `X-Signature: sha1=<HMAC-SHA1(body, secret)>`。
+
+公网部署时两个都应配置，并保持与 OneBot 侧完全一致。只配置 access token 而 OneBot 使用签名 secret 时，入站事件会被拒绝。
 
 当前只处理文本消息，卡片/选择器会降级为编号文本。QQ 官方 Bot API、频道消息和按钮交互不在本适配器范围内。
 

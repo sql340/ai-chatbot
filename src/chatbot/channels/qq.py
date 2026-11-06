@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import re
 from typing import Any
@@ -32,7 +34,7 @@ class QQOneBotAdapter:
         self._owns_client = client is None
 
     async def receive(self, request: ChannelHttpRequest) -> ChannelReceiveResult:
-        self._verify_token(request)
+        self._verify_request(request)
         try:
             payload = json.loads(request.body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -61,13 +63,23 @@ class QQOneBotAdapter:
         if self._owns_client:
             await self._client.aclose()
 
-    def _verify_token(self, request: ChannelHttpRequest) -> None:
+    def _verify_request(self, request: ChannelHttpRequest) -> None:
+        secret = self._settings.qq_onebot_webhook_secret
+        if secret:
+            signature = request.headers.get("x-signature", "")
+            expected = "sha1=" + hmac.new(
+                secret.encode(), request.body, hashlib.sha1
+            ).hexdigest()
+            if not signature or not hmac.compare_digest(expected, signature):
+                raise ChannelAuthError("invalid QQ OneBot webhook signature")
+            return
+
         expected = self._settings.qq_onebot_access_token
         if not expected:
             return
         authorization = request.headers.get("authorization", "")
         token = authorization.removeprefix("Bearer ").strip()
-        if token != expected:
+        if not hmac.compare_digest(token, expected):
             raise ChannelAuthError("invalid QQ OneBot access token")
 
     def _parse_message(self, payload: dict[str, Any]) -> InboundMessage | None:

@@ -80,6 +80,7 @@ class Settings(BaseSettings):
     qq_tenant_id: str = "default"
     qq_onebot_api_base_url: str = "http://localhost:3000"
     qq_onebot_access_token: str = ""
+    qq_onebot_webhook_secret: str = ""
     qq_timeout: float = 10.0
 
     wechat_enabled: bool = False

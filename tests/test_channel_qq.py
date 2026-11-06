@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 
 import httpx
 import pytest
 
-from chatbot.channels.base import ChannelHttpRequest
+from chatbot.channels.base import ChannelAuthError, ChannelHttpRequest
 from chatbot.channels.qq import QQOneBotAdapter
 from chatbot.config import Settings
 from chatbot.models import ChatResponse, OutboundItem
@@ -61,4 +63,28 @@ async def test_qq_parse_group_message_and_send() -> None:
     assert captured[0][0].path == "/send_group_msg"
     assert captured[0][1]["group_id"] == 67890
     assert captured[0][1]["message"] == "收到"
+
+
+@pytest.mark.asyncio
+async def test_qq_webhook_signature() -> None:
+    adapter = QQOneBotAdapter(qq_settings(QQ_ONEBOT_WEBHOOK_SECRET="webhook-secret"))
+    body = json.dumps(
+        {
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": 10000,
+            "user_id": 12345,
+            "message_id": 100,
+            "message": [{"type": "text", "data": {"text": "你好"}}],
+        }
+    ).encode()
+    signature = "sha1=" + hmac.new(b"webhook-secret", body, hashlib.sha1).hexdigest()
+    result = await adapter.receive(
+        ChannelHttpRequest("POST", {"x-signature": signature}, {}, body)
+    )
+    assert result.message is not None
+    assert result.message.text == "你好"
+
+    with pytest.raises(ChannelAuthError):
+        await adapter.receive(ChannelHttpRequest("POST", {}, {}, body))
 
