@@ -11,6 +11,7 @@ requires-python = ">=3.11,<4"
 dependencies = [
   "deepagents==0.7.32",
   "fastapi>=0.115",
+  "cryptography>=43.0",
   "httpx>=0.28",
   "langchain-openai>=1.0",
   "pydantic-settings>=2.7",
@@ -27,6 +28,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+chatbot = ["static/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

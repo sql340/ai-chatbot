@@ -64,11 +64,44 @@ class Settings(BaseSettings):
     jev_api_key: str = ""
     jev_model: str = ""
 
+    channel_event_dedupe_ttl_seconds: int = 3600
+    web_enabled: bool = True
+
+    feishu_enabled: bool = False
+    feishu_tenant_id: str = "default"
+    feishu_app_id: str = ""
+    feishu_app_secret: str = ""
+    feishu_encrypt_key: str = ""
+    feishu_verification_token: str = ""
+    feishu_api_base_url: str = "https://open.feishu.cn"
+    feishu_timeout: float = 10.0
+
+    qq_enabled: bool = False
+    qq_tenant_id: str = "default"
+    qq_onebot_api_base_url: str = "http://localhost:3000"
+    qq_onebot_access_token: str = ""
+    qq_timeout: float = 10.0
+
+    wechat_enabled: bool = False
+    wechat_tenant_id: str = "default"
+    wechat_token: str = ""
+    wechat_encoding_aes_key: str = ""
+    wechat_app_id: str = ""
+    wechat_app_secret: str = ""
+    wechat_api_base_url: str = "https://api.weixin.qq.com"
+    wechat_timeout: float = 10.0
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
 
-    @field_validator("llm_base_url", "rag_base_url")
+    @field_validator(
+        "llm_base_url",
+        "rag_base_url",
+        "feishu_api_base_url",
+        "qq_onebot_api_base_url",
+        "wechat_api_base_url",
+    )
     @classmethod
     def _strip_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")
@@ -81,6 +114,7 @@ class Settings(BaseSettings):
         "reply_max_chars",
         "llm_max_tokens",
         "rag_top_k",
+        "channel_event_dedupe_ttl_seconds",
     )
     @classmethod
     def _must_be_positive(cls, value: int) -> int:
