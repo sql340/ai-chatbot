@@ -4,6 +4,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -40,6 +41,23 @@ class AgentInvocationError(Exception):
     pass
 
 
+class GenerationSupersededError(Exception):
+    def __init__(self, session_id: str, epoch: int) -> None:
+        super().__init__(f"generation {epoch} for session {session_id} was superseded")
+        self.session_id = session_id
+        self.epoch = epoch
+
+
+@dataclass
+class GenerationHandle:
+    tenant_id: str
+    session_id: str
+    epoch: int
+    turn_no: int
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    task: asyncio.Task[Any] | None = None
+
+
 class ChatService:
     def __init__(
         self,
@@ -55,30 +73,63 @@ class ChatService:
         self.store = store
         self.locks = locks
         self.knowledge = knowledge
+        self._generations: dict[str, GenerationHandle] = {}
+
+    async def create_session(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        channel: str,
+        session_id: str | None = None,
+    ) -> SessionRecord:
+        session = SessionRecord(
+            id=session_id or str(uuid.uuid4()),
+            tenant_id=tenant_id,
+            user_id=user_id,
+            channel=channel,  # type: ignore[arg-type]
+        )
+        await self.store.create(session)
+        return session
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
         session_id = request.session_id or str(uuid.uuid4())
         await self._precheck_existing(request, session_id)
-        async with self.locks.acquire(request.tenant_id, session_id):
-            session = await self._load_or_create(request, session_id)
-            turn_no = session.turn_count + 1
-            self._ensure_active(session)
+        if request.session_id is None:
+            await self.create_session(
+                tenant_id=request.tenant_id,
+                user_id=request.user_id,
+                channel=request.channel,
+                session_id=session_id,
+            )
 
-            if turn_no > self.settings.max_turns:
-                return await self._force_handoff(session, turn_no)
+        session, handle, turn_no = await self._begin_turn(request, session_id)
+        if handle is None:
+            return await self._force_handoff(session, turn_no)
 
-            messages = self._build_messages(session, request.message)
+        try:
+            await self._ensure_current(handle)
+            messages = self._build_messages(session)
             context = self._agent_context(session)
-            try:
-                result = await self.agent.ainvoke(
+            task = asyncio.create_task(
+                self.agent.ainvoke(
                     {"messages": messages},
                     context=context,
                     config={"recursion_limit": 40},
                 )
+            )
+            handle.task = task
+            try:
+                result = await task
+            except asyncio.CancelledError:
+                if handle.cancel_event.is_set():
+                    raise GenerationSupersededError(handle.session_id, handle.epoch) from None
+                raise
             except Exception as exc:
                 logger.exception("agent invocation failed for session %s", session_id)
                 raise AgentInvocationError(str(exc)) from exc
 
+            await self._ensure_current(handle)
             text = self._last_ai_text(result)
             items = self._finalize_items(text, context, turn_no)
             status: SessionStatus = (
@@ -86,101 +137,179 @@ class ChatService:
                 if context.handoff_requested or turn_no >= self.settings.max_turns
                 else "active"
             )
-            self._commit_turn(session, turn_no, request.message, text, status)
-            await self.store.save(session)
+            await self._commit_turn(handle, text, status)
             return ChatResponse(
                 session_id=session.id,
                 turn_no=turn_no,
+                epoch=handle.epoch,
                 status=status,
                 messages=items,
             )
+        except asyncio.CancelledError:
+            if handle.cancel_event.is_set():
+                raise GenerationSupersededError(handle.session_id, handle.epoch) from None
+            raise
+        finally:
+            self._finish_generation(handle)
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         session_id = request.session_id or str(uuid.uuid4())
+        handle: GenerationHandle | None = None
         try:
             await self._precheck_existing(request, session_id)
-            async with self.locks.acquire(request.tenant_id, session_id):
-                session = await self._load_or_create(request, session_id)
-                turn_no = session.turn_count + 1
-                self._ensure_active(session)
+            if request.session_id is None:
+                await self.create_session(
+                    tenant_id=request.tenant_id,
+                    user_id=request.user_id,
+                    channel=request.channel,
+                    session_id=session_id,
+                )
 
-                if turn_no > self.settings.max_turns:
-                    response = await self._force_handoff(session, turn_no)
-                    yield "session", {"session_id": response.session_id, "turn_no": response.turn_no}
-                    for item in response.messages:
-                        yield "action", item.model_dump(mode="json")
-                    yield "done", {
-                        "session_id": response.session_id,
-                        "turn_no": response.turn_no,
-                        "status": response.status,
-                    }
-                    return
+            session, handle, turn_no = await self._begin_turn(request, session_id)
+            if handle is None:
+                response = await self._force_handoff(session, turn_no)
+                yield "session", {
+                    "session_id": response.session_id,
+                    "turn_no": response.turn_no,
+                    "epoch": response.epoch,
+                }
+                for item in response.messages:
+                    yield "action", item.model_dump(mode="json")
+                yield "done", {
+                    "session_id": response.session_id,
+                    "turn_no": response.turn_no,
+                    "epoch": response.epoch,
+                    "status": response.status,
+                }
+                return
 
-                yield "session", {"session_id": session.id, "turn_no": turn_no}
+            yield "session", {
+                "session_id": session.id,
+                "turn_no": turn_no,
+                "epoch": handle.epoch,
+            }
 
-                messages = self._build_messages(session, request.message)
-                context = self._agent_context(session)
-                streamed_text = ""
-                final_state: dict[str, Any] | None = None
-                try:
-                    async for mode, payload in self.agent.astream(
-                        {"messages": messages},
-                        context=context,
-                        config={"recursion_limit": 40},
-                        stream_mode=["messages", "values"],
-                    ):
-                        if mode == "messages":
-                            chunk, _metadata = payload
-                            if isinstance(chunk, AIMessage):
-                                text_delta = content_to_text(chunk.content)
-                                if text_delta:
-                                    streamed_text += text_delta
-                                    yield "delta", {"content": text_delta}
-                        elif mode == "values":
-                            final_state = payload
-                except asyncio.CancelledError:
-                    logger.info("stream cancelled for session %s", session.id)
-                    raise
-                except Exception:
-                    logger.exception("agent stream failed for session %s", session.id)
+            messages = self._build_messages(session)
+            context = self._agent_context(session)
+            streamed_text = ""
+            final_state: dict[str, Any] | None = None
+            try:
+                async for mode, payload in self.agent.astream(
+                    {"messages": messages},
+                    context=context,
+                    config={"recursion_limit": 40},
+                    stream_mode=["messages", "values"],
+                ):
+                    await self._ensure_current(handle)
+                    if mode == "messages":
+                        chunk, _metadata = payload
+                        if isinstance(chunk, AIMessage):
+                            text_delta = content_to_text(chunk.content)
+                            if text_delta:
+                                streamed_text += text_delta
+                                yield "delta", {
+                                    "content": text_delta,
+                                    "epoch": handle.epoch,
+                                }
+                    elif mode == "values":
+                        final_state = payload
+                await self._ensure_current(handle)
+            except GenerationSupersededError:
+                yield "error", {
+                    "code": "superseded",
+                    "message": "收到新消息，已按最新消息重新处理。",
+                }
+                yield "done", {
+                    "session_id": handle.session_id,
+                    "turn_no": handle.turn_no,
+                    "epoch": handle.epoch,
+                    "status": "active",
+                }
+                return
+            except asyncio.CancelledError:
+                if handle.cancel_event.is_set():
                     yield "error", {
-                        "code": "agent_error",
-                        "message": "客服暂时无法回复，请稍后重试。",
+                        "code": "superseded",
+                        "message": "收到新消息，已按最新消息重新处理。",
                     }
                     yield "done", {
-                        "session_id": session.id,
-                        "turn_no": turn_no,
-                        "status": session.status,
+                        "session_id": handle.session_id,
+                        "turn_no": handle.turn_no,
+                        "epoch": handle.epoch,
+                        "status": "active",
                     }
                     return
-
-                canonical_text = self._last_ai_text(final_state) or streamed_text
-                items = self._finalize_items(canonical_text, context, turn_no)
-                status = "handed_off" if context.handoff_requested or turn_no >= self.settings.max_turns else "active"
-
-                for item in items:
-                    event = "message" if item.kind == "text" else "action"
-                    yield event, item.model_dump(mode="json")
-
-                self._commit_turn(session, turn_no, request.message, canonical_text, status)
-                await self.store.save(session)
+                logger.info("stream cancelled for session %s", session.id)
+                raise
+            except Exception:
+                logger.exception("agent stream failed for session %s", session.id)
+                yield "error", {
+                    "code": "agent_error",
+                    "message": "客服暂时无法回复，请稍后重试。",
+                }
                 yield "done", {
                     "session_id": session.id,
                     "turn_no": turn_no,
-                    "status": status,
+                    "epoch": handle.epoch,
+                    "status": session.status,
                 }
+                return
+
+            canonical_text = self._last_ai_text(final_state) or streamed_text
+            items = self._finalize_items(canonical_text, context, turn_no)
+            status: SessionStatus = (
+                "handed_off"
+                if context.handoff_requested or turn_no >= self.settings.max_turns
+                else "active"
+            )
+
+            for item in items:
+                await self._ensure_current(handle)
+                event = "message" if item.kind == "text" else "action"
+                yield event, item.model_dump(mode="json")
+
+            await self._commit_turn(handle, canonical_text, status)
+            yield "done", {
+                "session_id": session.id,
+                "turn_no": turn_no,
+                "epoch": handle.epoch,
+                "status": status,
+            }
+        except GenerationSupersededError:
+            yield "error", {
+                "code": "superseded",
+                "message": "收到新消息，已按最新消息重新处理。",
+            }
+            yield "done", {
+                "session_id": session_id,
+                "turn_no": 0,
+                "epoch": 0,
+                "status": "active",
+            }
         except SessionBusyError:
             yield "error", {"code": "session_busy", "message": "上一条消息还在处理中，请稍后再试。"}
-            yield "done", {"session_id": session_id, "turn_no": 0, "status": "active"}
+            yield "done", {"session_id": session_id, "turn_no": 0, "epoch": 0, "status": "active"}
         except SessionNotFoundError:
             yield "error", {"code": "session_not_found", "message": "会话不存在或已过期。"}
-            yield "done", {"session_id": session_id, "turn_no": 0, "status": "closed"}
+            yield "done", {"session_id": session_id, "turn_no": 0, "epoch": 0, "status": "closed"}
         except SessionForbiddenError:
             yield "error", {"code": "forbidden", "message": "当前用户无权访问该会话。"}
-            yield "done", {"session_id": session_id, "turn_no": 0, "status": "closed"}
+            yield "done", {"session_id": session_id, "turn_no": 0, "epoch": 0, "status": "closed"}
         except SessionClosedError:
             yield "error", {"code": "session_closed", "message": "会话已经结束，请开启新会话。"}
-            yield "done", {"session_id": session_id, "turn_no": 0, "status": "closed"}
+            yield "done", {"session_id": session_id, "turn_no": 0, "epoch": 0, "status": "closed"}
+        finally:
+            if handle is not None:
+                self._finish_generation(handle)
+
+    async def is_current(self, tenant_id: str, session_id: str, epoch: int) -> bool:
+        if not session_id or epoch <= 0:
+            return False
+        try:
+            session = await self.store.get(tenant_id, session_id)
+        except SessionNotFoundError:
+            return False
+        return session.active_epoch == epoch
 
     async def get_session(self, tenant_id: str, user_id: str, session_id: str) -> SessionRecord:
         session = await self.store.get(tenant_id, session_id)
@@ -214,28 +343,89 @@ class ChatService:
         await self.locks.close()
         await self.store.close()
 
-    async def _load_or_create(self, request: ChatRequest, session_id: str) -> SessionRecord:
-        if request.session_id is None:
-            session = SessionRecord(
-                id=session_id,
-                tenant_id=request.tenant_id,
-                user_id=request.user_id,
-                channel=request.channel,
-            )
-            await self.store.create(session)
-            return session
+    async def _begin_turn(
+        self, request: ChatRequest, session_id: str
+    ) -> tuple[SessionRecord, GenerationHandle | None, int]:
+        while True:
+            session = await self.store.get(request.tenant_id, session_id)
+            if session.user_id != request.user_id:
+                raise SessionForbiddenError(session_id)
+            self._ensure_active(session)
 
-        session = await self.store.get(request.tenant_id, session_id)
-        if session.user_id != request.user_id:
-            raise SessionForbiddenError(session_id)
-        return session
+            turn_no = session.turn_count + 1
+            if turn_no > self.settings.max_turns:
+                return session, None, turn_no
+
+            expected_revision = session.revision
+            session.messages.append(StoredMessage(role="user", content=request.message))
+            session.turn_count = turn_no
+            session.active_epoch += 1
+            session.revision = expected_revision + 1
+            session.updated_at = datetime.now(UTC)
+
+            if not await self.store.save_if_revision(session, expected_revision):
+                await asyncio.sleep(0)
+                continue
+
+            handle = GenerationHandle(
+                tenant_id=session.tenant_id,
+                session_id=session.id,
+                epoch=session.active_epoch,
+                turn_no=turn_no,
+            )
+            self._supersede_previous(handle)
+            return session, handle, turn_no
+
+    def _supersede_previous(self, handle: GenerationHandle) -> None:
+        previous = self._generations.get(handle.session_id)
+        if previous is not None and previous.epoch < handle.epoch:
+            previous.cancel_event.set()
+            if previous.task is not None and not previous.task.done():
+                previous.task.cancel()
+        self._generations[handle.session_id] = handle
+
+    def _finish_generation(self, handle: GenerationHandle) -> None:
+        if self._generations.get(handle.session_id) is handle:
+            self._generations.pop(handle.session_id, None)
+
+    async def _ensure_current(self, handle: GenerationHandle) -> None:
+        if handle.cancel_event.is_set():
+            raise GenerationSupersededError(handle.session_id, handle.epoch)
+        try:
+            session = await self.store.get(handle.tenant_id, handle.session_id)
+        except SessionNotFoundError:
+            raise GenerationSupersededError(handle.session_id, handle.epoch) from None
+        if session.active_epoch != handle.epoch:
+            handle.cancel_event.set()
+            raise GenerationSupersededError(handle.session_id, handle.epoch)
+
+    async def _commit_turn(
+        self,
+        handle: GenerationHandle,
+        assistant_text: str,
+        status: SessionStatus,
+    ) -> None:
+        while True:
+            session = await self.store.get(handle.tenant_id, handle.session_id)
+            if session.active_epoch != handle.epoch:
+                raise GenerationSupersededError(handle.session_id, handle.epoch)
+            if session.status != "active":
+                raise SessionClosedError(handle.session_id)
+
+            expected_revision = session.revision
+            if assistant_text.strip():
+                session.messages.append(
+                    StoredMessage(role="assistant", content=assistant_text.strip())
+                )
+            session.status = status
+            session.revision = expected_revision + 1
+            session.updated_at = datetime.now(UTC)
+            if await self.store.save_if_revision(session, expected_revision):
+                return
+            await asyncio.sleep(0)
 
     async def _precheck_existing(self, request: ChatRequest, session_id: str) -> None:
-        """Reject cross-user access before waiting on the per-session lock.
-
-        This keeps a busy session from masking a 403/404 and avoids leaking
-        whether another user's conversation is currently being generated.
-        """
+        """Reject cross-user access before starting generation."""
 
         if request.session_id is None:
             return
@@ -253,17 +443,24 @@ class ChatService:
             text="这次对话已经达到最大轮次，我帮你转接人工同事继续处理。",
             payload={"reason": "max_turns"},
         )
-        session.status = "handed_off"
-        session.updated_at = datetime.now(UTC)
-        await self.store.save(session)
-        return ChatResponse(
-            session_id=session.id,
-            turn_no=turn_no,
-            status="handed_off",
-            messages=[item],
-        )
+        while True:
+            current = await self.store.get(session.tenant_id, session.id)
+            self._ensure_active(current)
+            expected_revision = current.revision
+            current.status = "handed_off"
+            current.revision = expected_revision + 1
+            current.updated_at = datetime.now(UTC)
+            if await self.store.save_if_revision(current, expected_revision):
+                return ChatResponse(
+                    session_id=current.id,
+                    turn_no=turn_no,
+                    epoch=current.active_epoch,
+                    status="handed_off",
+                    messages=[item],
+                )
+            await asyncio.sleep(0)
 
-    def _build_messages(self, session: SessionRecord, current: str) -> list[AnyMessage]:
+    def _build_messages(self, session: SessionRecord) -> list[AnyMessage]:
         history = session.messages[-self.settings.max_history_messages :]
         messages: list[AnyMessage] = []
         for item in history:
@@ -271,7 +468,6 @@ class ChatService:
                 messages.append(HumanMessage(content=item.content))
             else:
                 messages.append(AIMessage(content=item.content))
-        messages.append(HumanMessage(content=current))
         return messages
 
     def _agent_context(self, session: SessionRecord) -> AgentContext:
@@ -318,26 +514,11 @@ class ChatService:
             )
         return items
 
-    def _commit_turn(
-        self,
-        session: SessionRecord,
-        turn_no: int,
-        user_message: str,
-        assistant_text: str,
-        status: SessionStatus,
-    ) -> None:
-        session.messages.append(StoredMessage(role="user", content=user_message))
-        if assistant_text.strip():
-            session.messages.append(StoredMessage(role="assistant", content=assistant_text.strip()))
-        session.turn_count = turn_no
-        session.status = status
-        session.updated_at = datetime.now(UTC)
-
 
 __all__ = [
     "AgentInvocationError",
     "ChatService",
+    "GenerationSupersededError",
     "SessionClosedError",
     "SessionForbiddenError",
 ]
-

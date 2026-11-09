@@ -41,6 +41,7 @@ def test_chat_endpoint_and_stream() -> None:
         assert response.status_code == 200
         payload = response.json()
         assert payload["turn_no"] == 1
+        assert payload["epoch"] == 1
         assert len(payload["messages"]) == 2
 
         with client.stream(

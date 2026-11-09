@@ -23,6 +23,8 @@ class SessionRecord(BaseModel):
     channel: ChannelName
     status: SessionStatus = "active"
     turn_count: int = 0
+    active_epoch: int = 0
+    revision: int = 0
     messages: list[StoredMessage] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -57,6 +59,7 @@ class OutboundItem(BaseModel):
 class ChatResponse(BaseModel):
     session_id: str
     turn_no: int
+    epoch: int = 0
     status: SessionStatus
     messages: list[OutboundItem] = Field(default_factory=list)
 
@@ -68,6 +71,7 @@ class SessionView(BaseModel):
     channel: ChannelName
     status: SessionStatus
     turn_count: int
+    active_epoch: int
     messages: list[StoredMessage]
     created_at: datetime
     updated_at: datetime

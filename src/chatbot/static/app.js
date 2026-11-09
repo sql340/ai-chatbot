@@ -171,10 +171,10 @@ function setStageState(kind, text) {
 function setBusy(busy) {
   state.busy = busy;
   const closed = state.sessionStatus !== "active";
-  els.input.disabled = busy || closed;
-  els.sendButton.disabled = busy || closed;
-  els.stopButton.hidden = !busy || !state.streaming;
-  els.sendLabel.textContent = busy ? "生成中" : "发送";
+  els.input.disabled = closed;
+  els.sendButton.disabled = closed;
+  els.stopButton.hidden = !busy;
+  els.sendLabel.textContent = busy ? "打断并发送" : "发送";
   setStageState(busy ? "busy" : closed ? "closed" : "", busy ? "处理中" : closed ? "已转人工" : "可对话");
   if (!busy && !closed) {
     els.input.focus({ preventScroll: true });
@@ -500,8 +500,15 @@ function disableActions(button) {
 
 async function sendMessage(rawText) {
   const text = String(rawText || "").trim();
-  if (!text || state.busy || state.sessionStatus !== "active") {
+  if (!text || state.sessionStatus !== "active") {
     return;
+  }
+
+  if (state.busy && state.abortController) {
+    state.abortController.abort();
+    if (state.draft) {
+      removeDraft();
+    }
   }
 
   hideEmptyState();
@@ -514,12 +521,14 @@ async function sendMessage(rawText) {
   resizeInput();
 
   const runToken = ++state.runToken;
+  const controller = new AbortController();
+  state.abortController = controller;
   setBusy(true);
   try {
     if (state.streaming) {
-      await sendStreaming(text, runToken);
+      await sendStreaming(text, runToken, controller.signal);
     } else {
-      await sendOnce(text, runToken);
+      await sendOnce(text, runToken, controller.signal);
     }
   } catch (error) {
     if (runToken !== state.runToken) {
@@ -558,8 +567,8 @@ async function requestJson(path, payload, signal) {
   return response.json();
 }
 
-async function sendOnce(text, runToken) {
-  const data = await requestJson("/v1/channels/web/events", requestBody(text));
+async function sendOnce(text, runToken, signal) {
+  const data = await requestJson("/v1/channels/web/events", requestBody(text), signal);
   if (runToken !== state.runToken || !data) {
     return;
   }
@@ -572,13 +581,12 @@ async function sendOnce(text, runToken) {
   }
 }
 
-async function sendStreaming(text, runToken) {
-  state.abortController = new AbortController();
+async function sendStreaming(text, runToken, signal) {
   const response = await fetch(`${API_BASE}/v1/chat/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
     body: JSON.stringify(requestBody(text)),
-    signal: state.abortController.signal,
+    signal,
   });
   if (!response.ok) {
     throw new ApiError(await errorDetail(response), response.status);
@@ -641,6 +649,10 @@ function handleStreamEvent(name, data) {
   if (name === "error") {
     state.hadStreamError = true;
     removeDraft();
+    if (data.code === "superseded") {
+      showToast("已按最新消息重新处理");
+      return;
+    }
     appendMessage("system", data.message || "客服暂时无法回复，请稍后重试。");
     showToast(data.message || "回复生成失败");
     return;
@@ -739,6 +751,7 @@ function localizedError(detail) {
     "session is closed or handed off": "本次会话已经结束，请建立新会话。",
     "session does not belong to this user": "这个会话不属于当前用户，请建立新会话。",
     "session not found or expired": "会话不存在或已过期，请建立新会话。",
+    "generation superseded": "收到新消息，已按最新消息重新处理。",
     "agent invocation failed": "客服暂时无法回复，请稍后重试。",
     "invalid web chat payload": "消息格式不正确，请重新输入。",
   };

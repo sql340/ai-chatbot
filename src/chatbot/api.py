@@ -33,6 +33,7 @@ from .models import ChatRequest, ChatResponse, SessionView
 from .service import (
     AgentInvocationError,
     ChatService,
+    GenerationSupersededError,
     SessionClosedError,
     SessionForbiddenError,
 )
@@ -174,6 +175,8 @@ def create_app(
             raise HTTPException(status_code=403, detail="session does not belong to this user") from exc
         except SessionClosedError as exc:
             raise HTTPException(status_code=409, detail="session is closed or handed off") from exc
+        except GenerationSupersededError as exc:
+            raise HTTPException(status_code=409, detail="generation superseded") from exc
         except SessionBusyError as exc:
             raise HTTPException(status_code=409, detail="session is busy") from exc
         except AgentInvocationError as exc:
@@ -192,6 +195,8 @@ def create_app(
             raise HTTPException(status_code=403, detail="session does not belong to this user") from exc
         except SessionClosedError as exc:
             raise HTTPException(status_code=409, detail="session is closed or handed off") from exc
+        except GenerationSupersededError as exc:
+            raise HTTPException(status_code=409, detail="generation superseded") from exc
         except SessionBusyError as exc:
             raise HTTPException(status_code=409, detail="session is busy") from exc
         except AgentInvocationError as exc:
@@ -233,6 +238,7 @@ def create_app(
             channel=session.channel,
             status=session.status,
             turn_count=session.turn_count,
+            active_epoch=session.active_epoch,
             messages=session.messages,
             created_at=session.created_at,
             updated_at=session.updated_at,
