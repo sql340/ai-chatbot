@@ -55,6 +55,7 @@ def test_web_channel_reuses_session_and_serves_frontend() -> None:
         assert first.status_code == 200
         first_payload = first.json()
         assert first_payload["turn_no"] == 1
+        assert first_payload["epoch"] == 1
 
         second = client.post(
             "/v1/channels/web/events",
@@ -63,6 +64,7 @@ def test_web_channel_reuses_session_and_serves_frontend() -> None:
         assert second.status_code == 200
         assert second.json()["session_id"] == first_payload["session_id"]
         assert second.json()["turn_no"] == 2
+        assert second.json()["epoch"] == 2
 
         forbidden = client.post(
             "/v1/channels/web/events",

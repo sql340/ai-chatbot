@@ -4,6 +4,7 @@ import asyncio
 from typing import Protocol
 
 import redis.asyncio as redis
+from redis.exceptions import WatchError
 
 from .config import Settings
 from .models import SessionRecord
@@ -18,7 +19,7 @@ class SessionStore(Protocol):
 
     async def get(self, tenant_id: str, session_id: str) -> SessionRecord: ...
 
-    async def save(self, session: SessionRecord) -> None: ...
+    async def save_if_revision(self, session: SessionRecord, expected_revision: int) -> bool: ...
 
     async def ping(self) -> bool: ...
 
@@ -44,9 +45,14 @@ class MemorySessionStore:
                 raise SessionNotFoundError(session_id)
             return session.model_copy(deep=True)
 
-    async def save(self, session: SessionRecord) -> None:
+    async def save_if_revision(self, session: SessionRecord, expected_revision: int) -> bool:
         async with self._lock:
-            self._sessions[(session.tenant_id, session.id)] = session.model_copy(deep=True)
+            key = (session.tenant_id, session.id)
+            current = self._sessions.get(key)
+            if current is None or current.revision != expected_revision:
+                return False
+            self._sessions[key] = session.model_copy(deep=True)
+            return True
 
     async def ping(self) -> bool:
         return True
@@ -79,12 +85,29 @@ class RedisSessionStore:
             raise SessionNotFoundError(session_id)
         return SessionRecord.model_validate_json(raw)
 
-    async def save(self, session: SessionRecord) -> None:
-        await self._client.set(
-            self._key(session.tenant_id, session.id),
-            session.model_dump_json(),
-            ex=self._settings.session_ttl_seconds,
-        )
+    async def save_if_revision(self, session: SessionRecord, expected_revision: int) -> bool:
+        key = self._key(session.tenant_id, session.id)
+        async with self._client.pipeline(transaction=True) as pipe:
+            try:
+                await pipe.watch(key)
+                raw = await pipe.get(key)
+                if raw is None:
+                    await pipe.unwatch()
+                    return False
+                current = SessionRecord.model_validate_json(raw)
+                if current.revision != expected_revision:
+                    await pipe.unwatch()
+                    return False
+                pipe.multi()
+                pipe.set(
+                    key,
+                    session.model_dump_json(),
+                    ex=self._settings.session_ttl_seconds,
+                )
+                await pipe.execute()
+                return True
+            except WatchError:
+                return False
 
     async def ping(self) -> bool:
         return bool(await self._client.ping())
