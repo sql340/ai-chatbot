@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     session_ttl_seconds: int = 1800
     session_lock_ttl_ms: int = 120_000
     session_lock_wait_seconds: float = 2.0
+    idle_close_seconds: int = 1800
+    solved_close_seconds: int = 3600
+    reopen_window_seconds: int = 1800
+    lifecycle_sweep_interval_seconds: float = 30.0
 
     max_turns: int = 12
     max_history_messages: int = 30
@@ -110,6 +114,9 @@ class Settings(BaseSettings):
     @field_validator(
         "session_ttl_seconds",
         "session_lock_ttl_ms",
+        "idle_close_seconds",
+        "solved_close_seconds",
+        "reopen_window_seconds",
         "max_turns",
         "max_history_messages",
         "reply_max_chars",
@@ -126,6 +133,13 @@ class Settings(BaseSettings):
     @field_validator("session_lock_wait_seconds")
     @classmethod
     def _non_negative_wait(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("must be greater than or equal to 0")
+        return value
+
+    @field_validator("lifecycle_sweep_interval_seconds")
+    @classmethod
+    def _non_negative_interval(cls, value: float) -> float:
         if value < 0:
             raise ValueError("must be greater than or equal to 0")
         return value

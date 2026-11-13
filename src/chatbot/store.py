@@ -21,6 +21,8 @@ class SessionStore(Protocol):
 
     async def save_if_revision(self, session: SessionRecord, expected_revision: int) -> bool: ...
 
+    async def list_sessions(self, limit: int = 1000) -> list[SessionRecord]: ...
+
     async def ping(self) -> bool: ...
 
     async def close(self) -> None: ...
@@ -54,6 +56,13 @@ class MemorySessionStore:
             self._sessions[key] = session.model_copy(deep=True)
             return True
 
+    async def list_sessions(self, limit: int = 1000) -> list[SessionRecord]:
+        async with self._lock:
+            return [
+                session.model_copy(deep=True)
+                for session in list(self._sessions.values())[:limit]
+            ]
+
     async def ping(self) -> bool:
         return True
 
@@ -69,11 +78,19 @@ class RedisSessionStore:
     def _key(self, tenant_id: str, session_id: str) -> str:
         return f"{self._settings.redis_key_prefix}:{tenant_id}:session:{session_id}"
 
+    def _ttl_seconds(self) -> int:
+        return max(
+            self._settings.session_ttl_seconds,
+            self._settings.solved_close_seconds + 60,
+            self._settings.idle_close_seconds + 60,
+            self._settings.reopen_window_seconds + 60,
+        )
+
     async def create(self, session: SessionRecord) -> None:
         created = await self._client.set(
             self._key(session.tenant_id, session.id),
             session.model_dump_json(),
-            ex=self._settings.session_ttl_seconds,
+            ex=self._ttl_seconds(),
             nx=True,
         )
         if not created:
@@ -102,12 +119,32 @@ class RedisSessionStore:
                 pipe.set(
                     key,
                     session.model_dump_json(),
-                    ex=self._settings.session_ttl_seconds,
+                    ex=self._ttl_seconds(),
                 )
                 await pipe.execute()
                 return True
             except WatchError:
                 return False
+
+    async def list_sessions(self, limit: int = 1000) -> list[SessionRecord]:
+        pattern = f"{self._settings.redis_key_prefix}:*:session:*"
+        keys: list[str] = []
+        seen: set[str] = set()
+        async for key in self._client.scan_iter(match=pattern, count=200):
+            if key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+            if len(keys) >= limit:
+                break
+        if not keys:
+            return []
+        values = await self._client.mget(keys)
+        return [
+            SessionRecord.model_validate_json(value)
+            for value in values
+            if value is not None
+        ]
 
     async def ping(self) -> bool:
         return bool(await self._client.ping())

@@ -5,7 +5,6 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
@@ -13,11 +12,20 @@ from langgraph.graph.state import CompiledStateGraph
 
 from .config import Settings
 from .knowledge import KnowledgeProvider
+from .lifecycle import (
+    can_reopen,
+    idle_close_target,
+    is_human_owned,
+    now_utc,
+    transition_session,
+)
 from .locks import SessionBusyError, SessionLockManager
 from .models import (
     ChatRequest,
     ChatResponse,
     OutboundItem,
+    Satisfaction,
+    SatisfactionRequest,
     SessionRecord,
     SessionStatus,
     StoredMessage,
@@ -34,6 +42,10 @@ class SessionForbiddenError(Exception):
 
 
 class SessionClosedError(Exception):
+    pass
+
+
+class SatisfactionUnavailableError(Exception):
     pass
 
 
@@ -56,6 +68,14 @@ class GenerationHandle:
     turn_no: int
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task[Any] | None = None
+
+
+@dataclass
+class TurnStart:
+    session: SessionRecord
+    handle: GenerationHandle | None
+    turn_no: int
+    immediate_response: ChatResponse | None = None
 
 
 class ChatService:
@@ -82,12 +102,14 @@ class ChatService:
         user_id: str,
         channel: str,
         session_id: str | None = None,
+        parent_session_id: str | None = None,
     ) -> SessionRecord:
         session = SessionRecord(
             id=session_id or str(uuid.uuid4()),
             tenant_id=tenant_id,
             user_id=user_id,
             channel=channel,  # type: ignore[arg-type]
+            parent_session_id=parent_session_id,
         )
         await self.store.create(session)
         return session
@@ -103,14 +125,16 @@ class ChatService:
                 session_id=session_id,
             )
 
-        session, handle, turn_no = await self._begin_turn(request, session_id)
-        if handle is None:
-            return await self._force_handoff(session, turn_no)
+        start = await self._begin_turn(request, session_id)
+        if start.immediate_response is not None:
+            return start.immediate_response
 
+        handle = start.handle
+        assert handle is not None
         try:
             await self._ensure_current(handle)
-            messages = self._build_messages(session)
-            context = self._agent_context(session)
+            messages = self._build_messages(start.session)
+            context = self._agent_context(start.session)
             task = asyncio.create_task(
                 self.agent.ainvoke(
                     {"messages": messages},
@@ -131,16 +155,19 @@ class ChatService:
 
             await self._ensure_current(handle)
             text = self._last_ai_text(result)
-            items = self._finalize_items(text, context, turn_no)
-            status: SessionStatus = (
-                "handed_off"
-                if context.handoff_requested or turn_no >= self.settings.max_turns
-                else "active"
+            items, status, reason, resolution_summary = self._build_turn_result(
+                text, context, start.turn_no
             )
-            await self._commit_turn(handle, text, status)
+            await self._commit_turn(
+                handle,
+                text,
+                status,
+                reason=reason,
+                resolution_summary=resolution_summary,
+            )
             return ChatResponse(
-                session_id=session.id,
-                turn_no=turn_no,
+                session_id=start.session.id,
+                turn_no=start.turn_no,
                 epoch=handle.epoch,
                 status=status,
                 messages=items,
@@ -165,16 +192,17 @@ class ChatService:
                     session_id=session_id,
                 )
 
-            session, handle, turn_no = await self._begin_turn(request, session_id)
-            if handle is None:
-                response = await self._force_handoff(session, turn_no)
+            start = await self._begin_turn(request, session_id)
+            if start.immediate_response is not None:
+                response = start.immediate_response
                 yield "session", {
                     "session_id": response.session_id,
                     "turn_no": response.turn_no,
                     "epoch": response.epoch,
                 }
                 for item in response.messages:
-                    yield "action", item.model_dump(mode="json")
+                    event = "message" if item.kind == "text" else "action"
+                    yield event, item.model_dump(mode="json")
                 yield "done", {
                     "session_id": response.session_id,
                     "turn_no": response.turn_no,
@@ -183,14 +211,16 @@ class ChatService:
                 }
                 return
 
+            handle = start.handle
+            assert handle is not None
             yield "session", {
-                "session_id": session.id,
-                "turn_no": turn_no,
+                "session_id": start.session.id,
+                "turn_no": start.turn_no,
                 "epoch": handle.epoch,
             }
 
-            messages = self._build_messages(session)
-            context = self._agent_context(session)
+            messages = self._build_messages(start.session)
+            context = self._agent_context(start.session)
             streamed_text = ""
             final_state: dict[str, Any] | None = None
             try:
@@ -239,39 +269,40 @@ class ChatService:
                         "status": "active",
                     }
                     return
-                logger.info("stream cancelled for session %s", session.id)
+                logger.info("stream cancelled for session %s", start.session.id)
                 raise
             except Exception:
-                logger.exception("agent stream failed for session %s", session.id)
+                logger.exception("agent stream failed for session %s", start.session.id)
                 yield "error", {
                     "code": "agent_error",
                     "message": "客服暂时无法回复，请稍后重试。",
                 }
                 yield "done", {
-                    "session_id": session.id,
-                    "turn_no": turn_no,
+                    "session_id": start.session.id,
+                    "turn_no": start.turn_no,
                     "epoch": handle.epoch,
-                    "status": session.status,
+                    "status": start.session.status,
                 }
                 return
 
             canonical_text = self._last_ai_text(final_state) or streamed_text
-            items = self._finalize_items(canonical_text, context, turn_no)
-            status: SessionStatus = (
-                "handed_off"
-                if context.handoff_requested or turn_no >= self.settings.max_turns
-                else "active"
+            items, status, reason, resolution_summary = self._build_turn_result(
+                canonical_text, context, start.turn_no
             )
 
+            await self._commit_turn(
+                handle,
+                canonical_text,
+                status,
+                reason=reason,
+                resolution_summary=resolution_summary,
+            )
             for item in items:
-                await self._ensure_current(handle)
                 event = "message" if item.kind == "text" else "action"
                 yield event, item.model_dump(mode="json")
-
-            await self._commit_turn(handle, canonical_text, status)
             yield "done", {
-                "session_id": session.id,
-                "turn_no": turn_no,
+                "session_id": start.session.id,
+                "turn_no": start.turn_no,
                 "epoch": handle.epoch,
                 "status": status,
             }
@@ -301,6 +332,48 @@ class ChatService:
         finally:
             if handle is not None:
                 self._finish_generation(handle)
+
+    async def submit_satisfaction(
+        self,
+        request: SatisfactionRequest,
+        session_id: str,
+    ) -> SessionRecord:
+        session = await self.get_session(request.tenant_id, request.user_id, session_id)
+        if session.satisfaction is not None:
+            return session
+        return await self._record_satisfaction(
+            request.tenant_id,
+            request.user_id,
+            session_id,
+            score=request.score,
+            comment=request.comment,
+        )
+
+    async def close_session(
+        self,
+        tenant_id: str,
+        user_id: str,
+        session_id: str,
+        reason: str,
+    ) -> SessionRecord:
+        await self.get_session(tenant_id, user_id, session_id)
+        return await self._close_session(tenant_id, session_id, reason=reason)
+
+    async def sweep_lifecycle(self) -> dict[str, int]:
+        """Close idle bot sessions and expired solved sessions."""
+
+        closed_idle = 0
+        closed_solved = 0
+        for candidate in await self.store.list_sessions():
+            closed_reason = await self._close_if_expired(
+                candidate.tenant_id,
+                candidate.id,
+            )
+            if closed_reason == "idle_timeout":
+                closed_idle += 1
+            elif closed_reason == "solved_timeout":
+                closed_solved += 1
+        return {"idle_timeout": closed_idle, "solved_timeout": closed_solved}
 
     async def is_current(self, tenant_id: str, session_id: str, epoch: int) -> bool:
         if not session_id or epoch <= 0:
@@ -338,30 +411,136 @@ class ChatService:
         }
 
     async def close(self) -> None:
+        for handle in list(self._generations.values()):
+            handle.cancel_event.set()
+            if handle.task is not None and not handle.task.done():
+                handle.task.cancel()
+        self._generations.clear()
         if self.knowledge is not None:
             await self.knowledge.close()
         await self.locks.close()
         await self.store.close()
 
-    async def _begin_turn(
-        self, request: ChatRequest, session_id: str
-    ) -> tuple[SessionRecord, GenerationHandle | None, int]:
+    async def _begin_turn(self, request: ChatRequest, session_id: str) -> TurnStart:
         while True:
             session = await self.store.get(request.tenant_id, session_id)
             if session.user_id != request.user_id:
                 raise SessionForbiddenError(session_id)
-            self._ensure_active(session)
+            now = now_utc()
 
-            turn_no = session.turn_count + 1
-            if turn_no > self.settings.max_turns:
-                return session, None, turn_no
+            if session.status == "closed":
+                raise SessionClosedError(session_id)
+
+            if is_human_owned(session.status):
+                expected_revision = session.revision
+                session.messages.append(StoredMessage(role="user", content=request.message))
+                session.active_epoch += 1
+                session.last_activity_at = now
+                item = OutboundItem(
+                    kind="handoff",
+                    text=(
+                        "你的补充已经记录，正在为你转接人工同事。"
+                        if session.status == "handoff_pending"
+                        else "人工同事正在处理，你的补充已经记录。"
+                    ),
+                    payload={"reason": "human_owned"},
+                )
+                session.messages.append(StoredMessage(role="assistant", content=item.text or ""))
+                session.revision = expected_revision + 1
+                session.updated_at = now
+                if await self.store.save_if_revision(session, expected_revision):
+                    self._cancel_generation(session.id)
+                    return TurnStart(
+                        session=session,
+                        handle=None,
+                        turn_no=session.turn_count,
+                        immediate_response=ChatResponse(
+                            session_id=session.id,
+                            turn_no=session.turn_count,
+                            epoch=session.active_epoch,
+                            status=session.status,
+                            messages=[item],
+                        ),
+                    )
+                await asyncio.sleep(0)
+                continue
+
+            if session.status == "solved":
+                if (
+                    session.satisfaction is None
+                    and session.satisfaction_prompted_at is not None
+                    and request.message in {"1", "2", "3", "4", "5"}
+                ):
+                    score = int(request.message)
+                    solved = await self._record_satisfaction(
+                        request.tenant_id,
+                        request.user_id,
+                        session_id,
+                        score=score,
+                        comment=None,
+                        user_text=request.message,
+                    )
+                    return TurnStart(
+                        session=solved,
+                        handle=None,
+                        turn_no=solved.turn_count,
+                        immediate_response=self._satisfaction_response(solved),
+                    )
+                if not can_reopen(
+                    session,
+                    reopen_window_seconds=self.settings.reopen_window_seconds,
+                    now=now,
+                ):
+                    await self._close_session(
+                        request.tenant_id,
+                        session_id,
+                        reason="solved_timeout",
+                        expected_status="solved",
+                    )
+                    raise SessionClosedError(session_id)
+
+                transition_session(session, "active", reason="reopened", now=now)
+
+            if session.status != "active":
+                await asyncio.sleep(0)
+                continue
+
+            if session.turn_count >= self.settings.max_turns:
+                expected_revision = session.revision
+                session.messages.append(StoredMessage(role="user", content=request.message))
+                session.active_epoch += 1
+                session.last_activity_at = now
+                transition_session(session, "handoff_pending", reason="max_turns", now=now)
+                item = OutboundItem(
+                    kind="handoff",
+                    text="这次对话已经达到最大轮次，我帮你转接人工同事继续处理。",
+                    payload={"reason": "max_turns"},
+                )
+                session.revision = expected_revision + 1
+                if await self.store.save_if_revision(session, expected_revision):
+                    self._cancel_generation(session.id)
+                    return TurnStart(
+                        session=session,
+                        handle=None,
+                        turn_no=session.turn_count,
+                        immediate_response=ChatResponse(
+                            session_id=session.id,
+                            turn_no=session.turn_count,
+                            epoch=session.active_epoch,
+                            status="handoff_pending",
+                            messages=[item],
+                        ),
+                    )
+                await asyncio.sleep(0)
+                continue
 
             expected_revision = session.revision
+            turn_no = session.turn_count + 1
             session.messages.append(StoredMessage(role="user", content=request.message))
-            session.turn_count = turn_no
             session.active_epoch += 1
+            session.last_activity_at = now
             session.revision = expected_revision + 1
-            session.updated_at = datetime.now(UTC)
+            session.updated_at = now
 
             if not await self.store.save_if_revision(session, expected_revision):
                 await asyncio.sleep(0)
@@ -374,7 +553,238 @@ class ChatService:
                 turn_no=turn_no,
             )
             self._supersede_previous(handle)
-            return session, handle, turn_no
+            return TurnStart(session=session, handle=handle, turn_no=turn_no)
+
+    async def _commit_turn(
+        self,
+        handle: GenerationHandle,
+        assistant_text: str,
+        status: SessionStatus,
+        *,
+        reason: str | None,
+        resolution_summary: str | None,
+    ) -> None:
+        while True:
+            session = await self.store.get(handle.tenant_id, handle.session_id)
+            if session.active_epoch != handle.epoch:
+                raise GenerationSupersededError(handle.session_id, handle.epoch)
+            if session.status != "active":
+                raise SessionClosedError(handle.session_id)
+
+            expected_revision = session.revision
+            now = now_utc()
+            if assistant_text.strip():
+                session.messages.append(
+                    StoredMessage(role="assistant", content=assistant_text.strip())
+                )
+            if status == "active":
+                session.status_reason = reason
+                session.updated_at = now
+            else:
+                transition_session(session, status, reason=reason, now=now)
+            if status == "solved":
+                session.resolution_summary = resolution_summary
+                session.satisfaction_prompted_at = now
+            session.turn_count = handle.turn_no
+            session.last_activity_at = now
+            session.revision = expected_revision + 1
+            if await self.store.save_if_revision(session, expected_revision):
+                return
+            await asyncio.sleep(0)
+
+    async def _record_satisfaction(
+        self,
+        tenant_id: str,
+        user_id: str,
+        session_id: str,
+        *,
+        score: int,
+        comment: str | None,
+        user_text: str | None = None,
+    ) -> SessionRecord:
+        while True:
+            session = await self.store.get(tenant_id, session_id)
+            if session.user_id != user_id:
+                raise SessionForbiddenError(session_id)
+            if session.satisfaction is not None:
+                return session
+            if session.status != "solved" or session.satisfaction_prompted_at is None:
+                raise SatisfactionUnavailableError(session_id)
+
+            expected_revision = session.revision
+            now = now_utc()
+            target: SessionStatus = "closed" if score >= 3 else "handoff_pending"
+            reason = "satisfaction_submitted" if target == "closed" else "low_satisfaction"
+            if user_text:
+                session.messages.append(StoredMessage(role="user", content=user_text))
+            session.satisfaction = Satisfaction(score=score, comment=comment, submitted_at=now)
+            transition_session(session, target, reason=reason, now=now)
+            session.active_epoch += 1
+            session.last_activity_at = now
+            if user_text:
+                acknowledgement = self._satisfaction_acknowledgement(target)
+                session.messages.append(
+                    StoredMessage(role="assistant", content=acknowledgement)
+                )
+                session.turn_count += 1
+            session.revision = expected_revision + 1
+
+            if await self.store.save_if_revision(session, expected_revision):
+                self._cancel_generation(session.id)
+                return session
+            await asyncio.sleep(0)
+
+    def _satisfaction_response(self, session: SessionRecord) -> ChatResponse:
+        target = session.status
+        messages = [
+            OutboundItem(
+                kind="text",
+                text=self._satisfaction_acknowledgement(target),
+            )
+        ]
+        if target == "handoff_pending":
+            messages.append(
+                OutboundItem(
+                    kind="handoff",
+                    text="这次没有解决好，我帮你转接人工同事继续处理。",
+                    payload={"reason": "low_satisfaction"},
+                )
+            )
+        return ChatResponse(
+            session_id=session.id,
+            turn_no=session.turn_count,
+            epoch=session.active_epoch,
+            status=target,
+            messages=messages,
+        )
+
+    @staticmethod
+    def _satisfaction_acknowledgement(status: SessionStatus) -> str:
+        if status == "handoff_pending":
+            return "抱歉这次没有解决好，我帮你转接人工同事继续处理。"
+        return "谢谢你的评分，很高兴这次能帮到你。"
+
+    async def _close_session(
+        self,
+        tenant_id: str,
+        session_id: str,
+        *,
+        reason: str,
+        expected_status: SessionStatus | None = None,
+    ) -> SessionRecord:
+        while True:
+            session = await self.store.get(tenant_id, session_id)
+            if session.status == "closed":
+                return session
+            if expected_status is not None and session.status != expected_status:
+                raise SessionClosedError(session_id)
+
+            expected_revision = session.revision
+            now = now_utc()
+            transition_session(session, "closed", reason=reason, now=now)
+            session.active_epoch += 1
+            session.last_activity_at = now
+            session.revision = expected_revision + 1
+            if await self.store.save_if_revision(session, expected_revision):
+                self._cancel_generation(session.id)
+                return session
+            await asyncio.sleep(0)
+
+    async def _close_if_expired(self, tenant_id: str, session_id: str) -> str | None:
+        while True:
+            try:
+                session = await self.store.get(tenant_id, session_id)
+            except SessionNotFoundError:
+                return None
+            target = idle_close_target(
+                session,
+                idle_close_seconds=self.settings.idle_close_seconds,
+                solved_close_seconds=self.settings.solved_close_seconds,
+            )
+            if target is None:
+                return None
+            _status, reason = target
+            expected_revision = session.revision
+            now = now_utc()
+            transition_session(session, "closed", reason=reason, now=now)
+            session.active_epoch += 1
+            session.last_activity_at = now
+            session.revision = expected_revision + 1
+            if await self.store.save_if_revision(session, expected_revision):
+                self._cancel_generation(session.id)
+                return reason
+            await asyncio.sleep(0)
+
+    def _build_turn_result(
+        self,
+        text: str,
+        context: AgentContext,
+        turn_no: int,
+    ) -> tuple[list[OutboundItem], SessionStatus, str | None, str | None]:
+        items = [
+            OutboundItem(kind="text", text=part)
+            for part in split_reply(text, self.settings.reply_max_chars)
+        ]
+        items.extend(context.outbox)
+
+        if context.handoff_requested:
+            status: SessionStatus = "handoff_pending"
+            reason = context.handoff_reason or "agent_handoff"
+            resolution_summary = None
+        elif context.resolution_requested:
+            status = "solved"
+            reason = "resolved"
+            resolution_summary = context.resolution_summary or "用户问题已确认解决。"
+        elif turn_no >= self.settings.max_turns:
+            status = "handoff_pending"
+            reason = "max_turns"
+            resolution_summary = None
+            if not any(item.kind == "handoff" for item in items):
+                items.append(
+                    OutboundItem(
+                        kind="handoff",
+                        text="这次对话已经比较长了，我帮你转接人工同事继续处理。",
+                        payload={"reason": "max_turns"},
+                    )
+                )
+        else:
+            status = "active"
+            reason = None
+            resolution_summary = None
+
+        if status == "solved":
+            items.append(self._satisfaction_prompt())
+
+        if not items:
+            status = "handoff_pending"
+            reason = "empty_model_response"
+            resolution_summary = None
+            items.append(
+                OutboundItem(
+                    kind="handoff",
+                    text="我暂时没能确认该怎么处理，帮你转接人工同事。",
+                    payload={"reason": "empty_model_response"},
+                )
+            )
+        return items, status, reason, resolution_summary
+
+    @staticmethod
+    def _satisfaction_prompt() -> OutboundItem:
+        return OutboundItem(
+            kind="select",
+            payload={
+                "kind": "satisfaction",
+                "question": "这次服务有帮到你吗？请为本次服务打分。",
+                "options": [
+                    {"label": "1 · 很不满意", "value": "1"},
+                    {"label": "2 · 不满意", "value": "2"},
+                    {"label": "3 · 一般", "value": "3"},
+                    {"label": "4 · 满意", "value": "4"},
+                    {"label": "5 · 非常满意", "value": "5"},
+                ],
+                "allow_multiple": False,
+            },
+        )
 
     def _supersede_previous(self, handle: GenerationHandle) -> None:
         previous = self._generations.get(handle.session_id)
@@ -383,6 +793,14 @@ class ChatService:
             if previous.task is not None and not previous.task.done():
                 previous.task.cancel()
         self._generations[handle.session_id] = handle
+
+    def _cancel_generation(self, session_id: str) -> None:
+        handle = self._generations.get(session_id)
+        if handle is None:
+            return
+        handle.cancel_event.set()
+        if handle.task is not None and not handle.task.done():
+            handle.task.cancel()
 
     def _finish_generation(self, handle: GenerationHandle) -> None:
         if self._generations.get(handle.session_id) is handle:
@@ -399,31 +817,6 @@ class ChatService:
             handle.cancel_event.set()
             raise GenerationSupersededError(handle.session_id, handle.epoch)
 
-    async def _commit_turn(
-        self,
-        handle: GenerationHandle,
-        assistant_text: str,
-        status: SessionStatus,
-    ) -> None:
-        while True:
-            session = await self.store.get(handle.tenant_id, handle.session_id)
-            if session.active_epoch != handle.epoch:
-                raise GenerationSupersededError(handle.session_id, handle.epoch)
-            if session.status != "active":
-                raise SessionClosedError(handle.session_id)
-
-            expected_revision = session.revision
-            if assistant_text.strip():
-                session.messages.append(
-                    StoredMessage(role="assistant", content=assistant_text.strip())
-                )
-            session.status = status
-            session.revision = expected_revision + 1
-            session.updated_at = datetime.now(UTC)
-            if await self.store.save_if_revision(session, expected_revision):
-                return
-            await asyncio.sleep(0)
-
     async def _precheck_existing(self, request: ChatRequest, session_id: str) -> None:
         """Reject cross-user access before starting generation."""
 
@@ -432,33 +825,6 @@ class ChatService:
         session = await self.store.get(request.tenant_id, session_id)
         if session.user_id != request.user_id:
             raise SessionForbiddenError(session_id)
-
-    def _ensure_active(self, session: SessionRecord) -> None:
-        if session.status != "active":
-            raise SessionClosedError(session.id)
-
-    async def _force_handoff(self, session: SessionRecord, turn_no: int) -> ChatResponse:
-        item = OutboundItem(
-            kind="handoff",
-            text="这次对话已经达到最大轮次，我帮你转接人工同事继续处理。",
-            payload={"reason": "max_turns"},
-        )
-        while True:
-            current = await self.store.get(session.tenant_id, session.id)
-            self._ensure_active(current)
-            expected_revision = current.revision
-            current.status = "handed_off"
-            current.revision = expected_revision + 1
-            current.updated_at = datetime.now(UTC)
-            if await self.store.save_if_revision(current, expected_revision):
-                return ChatResponse(
-                    session_id=current.id,
-                    turn_no=turn_no,
-                    epoch=current.active_epoch,
-                    status="handed_off",
-                    messages=[item],
-                )
-            await asyncio.sleep(0)
 
     def _build_messages(self, session: SessionRecord) -> list[AnyMessage]:
         history = session.messages[-self.settings.max_history_messages :]
@@ -488,37 +854,12 @@ class ChatService:
                     return text
         return ""
 
-    def _finalize_items(self, text: str, context: AgentContext, turn_no: int) -> list[OutboundItem]:
-        items = [
-            OutboundItem(kind="text", text=part)
-            for part in split_reply(text, self.settings.reply_max_chars)
-        ]
-        items.extend(context.outbox)
-
-        if turn_no >= self.settings.max_turns and not context.handoff_requested:
-            items.append(
-                OutboundItem(
-                    kind="handoff",
-                    text="这次对话已经比较长了，我帮你转接人工同事继续处理。",
-                    payload={"reason": "max_turns"},
-                )
-            )
-
-        if not items:
-            items.append(
-                OutboundItem(
-                    kind="handoff",
-                    text="我暂时没能确认该怎么处理，帮你转接人工同事。",
-                    payload={"reason": "empty_model_response"},
-                )
-            )
-        return items
-
 
 __all__ = [
     "AgentInvocationError",
     "ChatService",
     "GenerationSupersededError",
+    "SatisfactionUnavailableError",
     "SessionClosedError",
     "SessionForbiddenError",
 ]

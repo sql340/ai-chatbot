@@ -10,6 +10,7 @@
 - Redis 会话存储和按会话租约锁；本地 Redis 限制为 64 MB。
 - 租户隔离：知识检索和会话键都带 `tenant_id`。
 - 按两个换行拆分回复，单条消息长度可配置。
+- 会话生命周期 `active / handoff_pending / human_active / solved / closed`、CSAT 评分、手工会话和空闲/解决后超时回收。
 - 飞书、QQ OneBot、微信公众号和网页渠道适配器；网页渠道自带联调页面。
 
 当前仍是单实例版本：渠道事件在进程内异步处理，会话绑定和事件去重可以使用 Redis。多租户识别、持久化消息队列、跨实例取消和钉钉适配仍待后续补全。
@@ -119,6 +120,8 @@ curl -N http://localhost:8000/v1/chat/stream \
 - `GET /`：网页联调页面。
 - `GET|POST /v1/channels/{channel}/events`：统一渠道回调入口；当前支持 `web`、`feishu`、`qq`、`wechat`。
 - `GET /v1/sessions/{session_id}?tenant_id=...&user_id=...`：读取会话。
+- `POST /v1/sessions/{session_id}/close`：用户主动结束会话；重复调用幂等。
+- `POST /v1/sessions/{session_id}/satisfaction`：提交 1～5 分满意度；4～5 分结束会话，1～2 分转人工。
 - `http://localhost:8000/docs`：OpenAPI 文档。
 
 当前 HTTP 接口信任请求里的 `tenant_id`/`user_id`。生产环境必须由企业网关或渠道适配器完成身份鉴权，并用鉴权结果覆盖这两个字段，不能直接相信客户端传入值。
@@ -280,8 +283,23 @@ RAG_TOP_K=4
 - 渠道首次消息使用会话级锁完成原子 `get-or-create`，同一用户并发首消息不会创建多个会话。
 - 每条用户消息分配递增 `active_epoch`，并用 `revision` CAS 写入；用户消息在生成前落库，旧生成的 assistant 结果不会覆盖新消息。
 - 同一进程内新消息会取消旧的非流式生成；流式生成会在下一个事件检查点停止。旧结果提交前和渠道发送前都会再次校验 epoch。
-- `MAX_TURNS` 默认 12；达到上限后自动产生 `handoff` action，并将会话标记为 `handed_off`。
+- 轮次 `turn_count` 只在 assistant 结果成功提交时递增，避免被 latest-wins 丢弃的用户消息虚增上限。
+- `MAX_TURNS` 默认 12；达到上限后自动产生 `handoff` action，并将会话标记为 `handoff_pending`。
 - 会话过期、会话结束、跨用户访问分别返回 404/409/403。
+
+会话状态：
+
+| 状态 | 含义 | 后续行为 |
+| --- | --- | --- |
+| `active` | 机器人处理中 | 正常生成；也可被新消息 supersede |
+| `handoff_pending` | 已请求人工，尚未接管 | 不调用模型；记录用户补充并回复转接提示 |
+| `human_active` | 真人已接管 | 不调用模型；记录用户补充，等待人工回复 |
+| `solved` | 问题已确认解决，等待评价 | 可提交 1～5 分，或在窗口内补充问题重新打开 |
+| `closed` | 会话结束 | 拒绝继续对话；用户应创建新会话 |
+
+`resolve_conversation` 工具会把会话置为 `solved`，并下发一个 `kind=select` 的满意度选择器。评分提交会提升 epoch 并取消仍在途的生成；低分转人工，高分关闭会话。`solved` 只有在 `REOPEN_WINDOW_SECONDS` 内可以直接补充问题恢复为 `active`，打开次数记录在 `reopened_count`。
+
+后台 sweep 默认每 30 秒运行一次：`active` 超过 `IDLE_CLOSE_SECONDS` 未活动会以 `idle_timeout` 关闭，`solved` 超过 `SOLVED_CLOSE_SECONDS` 未评价会以 `solved_timeout` 关闭。`handoff_pending` 和 `human_active` 不自动回收，应由后续人工坐席控制台处理。
 
 latest-wins 的语义是“最后收到的用户消息优先”，不是“最后生成的回复优先”：
 
@@ -295,7 +313,7 @@ latest-wins 的语义是“最后收到的用户消息优先”，不是“最�
 2. 多租户渠道身份映射：按飞书 app_id、微信 app_id、QQ self_id 等解析租户，而不是使用静态 `*_TENANT_ID`。
 3. 质检模型：自然度、事实一致性、身份和红线复核；不合格重生成，红线直接转人工。
 4. Jev 路由/选择适配器，用于意图路由、工具选择和高风险分流。
-5. 满意度评分、会话关闭策略、会话监控和运营指标。
+5. 人工坐席控制台：认领 `handoff_pending`、切换 `human_active`、人工关闭会话和 SLA 告警。
 6. 多实例消息消费、Redis 取消广播、outbox 幂等发送、重试和死信队列。
 7. 飞书卡片延迟更新、QQ 官方 Bot API、钉钉适配器。
 8. 可选的 Docker sandbox 和更细粒度工具权限。
@@ -306,4 +324,4 @@ latest-wins 的语义是“最后收到的用户消息优先”，不是“最�
 .venv/bin/pytest -q
 ```
 
-当前测试覆盖文本拆分、配置、知识事件解析、会话隔离、轮次上限、流式事件、HTTP/SSE 接口、渠道回调签名、事件去重、网页静态入口和微信安全模式解密。
+当前测试覆盖文本拆分、配置、知识事件解析、会话隔离、轮次上限、流式事件、HTTP/SSE 接口、渠道回调签名、事件去重、网页静态入口、微信安全模式解密，以及生命周期状态机、人工接管、CSAT、会话重开、超时 sweep 和关闭接口。

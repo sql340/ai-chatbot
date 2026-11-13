@@ -129,8 +129,18 @@ function updateSessionLabel() {
     return;
   }
   const shortId = state.sessionId.slice(0, 8);
-  els.sessionLabel.textContent = `${shortId} · ${state.sessionStatus}`;
+  els.sessionLabel.textContent = `${shortId} · ${statusLabel(state.sessionStatus)}`;
   els.sessionLabel.title = state.sessionId;
+}
+
+function statusLabel(status) {
+  return {
+    active: "对话中",
+    handoff_pending: "等待人工",
+    human_active: "人工处理中",
+    solved: "待确认解决",
+    closed: "已结束",
+  }[status] || status || "对话中";
 }
 
 function persistSession() {
@@ -170,13 +180,23 @@ function setStageState(kind, text) {
 
 function setBusy(busy) {
   state.busy = busy;
-  const closed = state.sessionStatus !== "active";
-  els.input.disabled = closed;
-  els.sendButton.disabled = closed;
+  const canCompose = state.sessionStatus === "active" || state.sessionStatus === "solved";
+  els.input.disabled = !canCompose;
+  els.sendButton.disabled = !canCompose;
   els.stopButton.hidden = !busy;
   els.sendLabel.textContent = busy ? "打断并发送" : "发送";
-  setStageState(busy ? "busy" : closed ? "closed" : "", busy ? "处理中" : closed ? "已转人工" : "可对话");
-  if (!busy && !closed) {
+  const stageText = {
+    active: "可对话",
+    solved: "待评分 · 可补充",
+    handoff_pending: "等待人工接入",
+    human_active: "人工处理中",
+    closed: "会话已结束",
+  }[state.sessionStatus] || "可对话";
+  const stageKind = ["handoff_pending", "human_active", "closed"].includes(state.sessionStatus)
+    ? "closed"
+    : "";
+  setStageState(busy ? "busy" : stageKind, busy ? "处理中" : stageText);
+  if (!busy && canCompose) {
     els.input.focus({ preventScroll: true });
   }
 }
@@ -204,8 +224,12 @@ function setSessionStatus(status) {
   state.sessionStatus = status || "active";
   updateSessionLabel();
   persistSession();
-  if (state.sessionStatus === "handed_off") {
-    setNotice("本次自动对话已结束，已为你转接人工。你可以建立新会话重新描述问题。");
+  if (state.sessionStatus === "handoff_pending") {
+    setNotice("正在为你转接人工同事，当前消息和上下文会一并交给对方。");
+  } else if (state.sessionStatus === "human_active") {
+    setNotice("人工同事正在处理本次会话，你补充的内容会被记录。");
+  } else if (state.sessionStatus === "solved") {
+    setNotice("问题已标记为解决。可以给本次服务评分，也可以继续补充问题。");
   } else if (state.sessionStatus === "closed") {
     setNotice("本次会话已结束。建立新会话即可继续咨询。");
   } else {
@@ -417,12 +441,13 @@ function renderCard(item) {
 
 function renderSelect(item) {
   const payload = item.payload || {};
+  const isSatisfaction = payload.kind === "satisfaction";
   const { body } = createMessage("assistant", "客服 / 选择");
   const select = document.createElement("section");
   select.className = "outbound-select";
   const kicker = document.createElement("span");
   kicker.className = "outbound-kicker";
-  kicker.textContent = "SELECT / 请选择一个选项";
+  kicker.textContent = isSatisfaction ? "CSAT / 服务满意度" : "SELECT / 请选择一个选项";
   const question = document.createElement("h4");
   question.textContent = payload.question || "你想办理哪项？";
   const hint = document.createElement("p");
@@ -445,11 +470,18 @@ function renderSelect(item) {
       button.type = "button";
       button.textContent = String(label);
       button.addEventListener("click", () => {
-        if (state.busy || state.sessionStatus !== "active") {
+        const allowed = isSatisfaction
+          ? state.sessionStatus === "solved"
+          : state.sessionStatus === "active";
+        if (state.busy || !allowed) {
           return;
         }
         disableActions(button);
-        sendMessage(String(value));
+        if (isSatisfaction) {
+          submitSatisfaction(Number(value));
+        } else {
+          sendMessage(String(value));
+        }
       });
       list.append(button);
     }
@@ -500,7 +532,8 @@ function disableActions(button) {
 
 async function sendMessage(rawText) {
   const text = String(rawText || "").trim();
-  if (!text || state.sessionStatus !== "active") {
+  const canCompose = state.sessionStatus === "active" || state.sessionStatus === "solved";
+  if (!text || !canCompose) {
     return;
   }
 
@@ -548,6 +581,40 @@ async function sendMessage(rawText) {
       state.abortController = null;
       setBusy(false);
     }
+  }
+}
+
+async function submitSatisfaction(score) {
+  if (state.sessionStatus !== "solved" || !state.sessionId) {
+    return;
+  }
+  if (!Number.isInteger(score) || score < 1 || score > 5) {
+    return;
+  }
+  setBusy(true);
+  try {
+    const data = await requestJson(
+      `/v1/sessions/${encodeURIComponent(state.sessionId)}/satisfaction`,
+      {
+        tenant_id: state.tenantId,
+        user_id: state.userId,
+        score,
+      },
+    );
+    appendMessage("user", `${score} 分`);
+    appendMessage(
+      "assistant",
+      score <= 2
+        ? "抱歉这次没有解决好，我帮你转接人工同事继续处理。"
+        : "谢谢你的评分，很高兴这次能帮到你。",
+    );
+    updateSessionFrom(data);
+  } catch (error) {
+    const message = error instanceof ApiError ? error.message : "评分提交失败，请稍后重试。";
+    appendMessage("system", message);
+    showToast(message);
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -748,9 +815,10 @@ async function errorDetail(response) {
 function localizedError(detail) {
   const messages = {
     "session is busy": "上一条消息还在处理，请稍后再试。",
-    "session is closed or handed off": "本次会话已经结束，请建立新会话。",
+    "session is closed": "本次会话已经结束，请建立新会话。",
     "session does not belong to this user": "这个会话不属于当前用户，请建立新会话。",
     "session not found or expired": "会话不存在或已过期，请建立新会话。",
+    "satisfaction is not available for this session": "当前会话还不能评分，或已经提交过评分。",
     "generation superseded": "收到新消息，已按最新消息重新处理。",
     "agent invocation failed": "客服暂时无法回复，请稍后重试。",
     "invalid web chat payload": "消息格式不正确，请重新输入。",
@@ -792,6 +860,22 @@ async function restoreSession() {
     }
     updateSessionLabel();
     setSessionStatus(state.sessionStatus);
+    if (state.sessionStatus === "solved" && !data.satisfaction) {
+      renderSelect({
+        kind: "select",
+        payload: {
+          kind: "satisfaction",
+          question: "这次服务有帮到你吗？请为本次服务打分。",
+          options: [
+            { label: "1 · 很不满意", value: "1" },
+            { label: "2 · 不满意", value: "2" },
+            { label: "3 · 一般", value: "3" },
+            { label: "4 · 满意", value: "4" },
+            { label: "5 · 非常满意", value: "5" },
+          ],
+        },
+      });
+    }
     if (!data.messages?.length) {
       showEmptyState();
     }

@@ -8,7 +8,7 @@ from langchain_core.messages import AIMessage
 from chatbot.config import Settings
 from chatbot.locks import build_lock_manager
 from chatbot.models import ChatRequest, OutboundItem
-from chatbot.service import ChatService, SessionClosedError, SessionForbiddenError
+from chatbot.service import ChatService, SessionForbiddenError
 from chatbot.store import SessionNotFoundError, build_session_store
 
 
@@ -94,22 +94,29 @@ async def test_chat_persists_and_isolates_sessions() -> None:
 
 @pytest.mark.asyncio
 async def test_max_turns_hands_off() -> None:
-    service = build_service(FakeAgent(), settings(MAX_TURNS=1))
+    agent = FakeAgent()
+    service = build_service(agent, settings(MAX_TURNS=1))
     result = await service.chat(
         ChatRequest(tenant_id="acme", user_id="u1", message="你好")
     )
-    assert result.status == "handed_off"
+    assert result.status == "handoff_pending"
     assert result.messages[-1].kind == "handoff"
+    assert agent.calls == 1
 
-    with pytest.raises(SessionClosedError):
-        await service.chat(
-            ChatRequest(
-                tenant_id="acme",
-                user_id="u1",
-                session_id=result.session_id,
-                message="继续",
-            )
+    follow_up = await service.chat(
+        ChatRequest(
+            tenant_id="acme",
+            user_id="u1",
+            session_id=result.session_id,
+            message="继续",
         )
+    )
+    assert follow_up.status == "handoff_pending"
+    assert follow_up.messages[0].kind == "handoff"
+    assert agent.calls == 1
+
+    stored = await service.get_session("acme", "u1", result.session_id)
+    assert stored.messages[-2].content == "继续"
 
 
 @pytest.mark.asyncio

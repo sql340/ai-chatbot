@@ -104,7 +104,7 @@ async def test_latest_message_wins_and_old_reply_is_discarded() -> None:
     assert not await service.is_current("acme", session.id, 1)
     assert await service.is_current("acme", session.id, 2)
     assert stored.active_epoch == 2
-    assert stored.turn_count == 2
+    assert stored.turn_count == 1
     assert [message.content for message in stored.messages] == [
         "旧问题",
         "新问题",
