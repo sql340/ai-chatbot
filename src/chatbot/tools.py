@@ -17,10 +17,13 @@ class AgentContext:
     channel: str
     outbox: list[OutboundItem] = field(default_factory=list)
     handoff_requested: bool = False
+    handoff_reason: str | None = None
+    resolution_requested: bool = False
+    resolution_summary: str | None = None
 
 
 def build_agent_tools(knowledge: KnowledgeProvider | None, top_k: int = 4) -> list[BaseTool]:
-    tools: list[BaseTool] = [send_card, ask_choice, handoff_to_human]
+    tools: list[BaseTool] = [send_card, ask_choice, handoff_to_human, resolve_conversation]
     if knowledge is not None:
         tools.insert(0, _build_search_knowledge_tool(knowledge, top_k))
     return tools
@@ -98,6 +101,7 @@ def handoff_to_human(reason: str, runtime: ToolRuntime[AgentContext]) -> str:
     """停止自动回复并转接真人客服，用于红线、投诉、高风险或无法处理的问题。"""
 
     runtime.context.handoff_requested = True
+    runtime.context.handoff_reason = reason.strip()
     runtime.context.outbox.append(
         OutboundItem(
             kind="handoff",
@@ -106,6 +110,18 @@ def handoff_to_human(reason: str, runtime: ToolRuntime[AgentContext]) -> str:
         )
     )
     return "已加入转人工队列。现在只用一句话告诉用户正在转接，不要继续提供结论。"
+
+
+@tool("resolve_conversation")
+def resolve_conversation(
+    summary: str,
+    runtime: ToolRuntime[AgentContext],
+) -> str:
+    """把本次会话标记为已解决，并保存一句可审计的解决摘要。"""
+
+    runtime.context.resolution_requested = True
+    runtime.context.resolution_summary = summary.strip()[:4000]
+    return "会话已标记为解决。用一句话确认结果，不要继续追问或推销。"
 
 
 __all__ = ["AgentContext", "build_agent_tools"]

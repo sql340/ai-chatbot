@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
@@ -29,11 +30,19 @@ from .channels.state import build_channel_binding_store, build_event_deduplicato
 from .config import Settings
 from .knowledge import build_knowledge_provider
 from .locks import SessionBusyError, build_lock_manager
-from .models import ChatRequest, ChatResponse, SessionView
+from .models import (
+    ChatRequest,
+    ChatResponse,
+    SatisfactionRequest,
+    SessionCloseRequest,
+    SessionRecord,
+    SessionView,
+)
 from .service import (
     AgentInvocationError,
     ChatService,
     GenerationSupersededError,
+    SatisfactionUnavailableError,
     SessionClosedError,
     SessionForbiddenError,
 )
@@ -90,9 +99,21 @@ def create_app(
             deduplicator=deduplicator,
             settings=resolved_settings,
         )
+        sweep_task: asyncio.Task[None] | None = None
+        if resolved_settings.lifecycle_sweep_interval_seconds > 0:
+            sweep_task = asyncio.create_task(
+                _lifecycle_sweeper(
+                    runtime,
+                    resolved_settings.lifecycle_sweep_interval_seconds,
+                )
+            )
         try:
             yield
         finally:
+            if sweep_task is not None:
+                sweep_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await sweep_task
             await channels.close()
             await bindings.close()
             await deduplicator.close()
@@ -174,7 +195,7 @@ def create_app(
         except SessionForbiddenError as exc:
             raise HTTPException(status_code=403, detail="session does not belong to this user") from exc
         except SessionClosedError as exc:
-            raise HTTPException(status_code=409, detail="session is closed or handed off") from exc
+            raise HTTPException(status_code=409, detail="session is closed") from exc
         except GenerationSupersededError as exc:
             raise HTTPException(status_code=409, detail="generation superseded") from exc
         except SessionBusyError as exc:
@@ -194,7 +215,7 @@ def create_app(
         except SessionForbiddenError as exc:
             raise HTTPException(status_code=403, detail="session does not belong to this user") from exc
         except SessionClosedError as exc:
-            raise HTTPException(status_code=409, detail="session is closed or handed off") from exc
+            raise HTTPException(status_code=409, detail="session is closed") from exc
         except GenerationSupersededError as exc:
             raise HTTPException(status_code=409, detail="generation superseded") from exc
         except SessionBusyError as exc:
@@ -231,18 +252,47 @@ def create_app(
             raise HTTPException(status_code=404, detail="session not found or expired") from exc
         except SessionForbiddenError as exc:
             raise HTTPException(status_code=403, detail="session does not belong to this user") from exc
-        return SessionView(
-            session_id=session.id,
-            tenant_id=session.tenant_id,
-            user_id=session.user_id,
-            channel=session.channel,
-            status=session.status,
-            turn_count=session.turn_count,
-            active_epoch=session.active_epoch,
-            messages=session.messages,
-            created_at=session.created_at,
-            updated_at=session.updated_at,
-        )
+        return _session_view(session)
+
+    @app.post("/v1/sessions/{session_id}/close", response_model=SessionView)
+    async def close_session(
+        session_id: str,
+        payload: SessionCloseRequest,
+        request: Request,
+    ) -> SessionView:
+        try:
+            session = await _service(request).close_session(
+                payload.tenant_id,
+                payload.user_id,
+                session_id,
+                payload.reason,
+            )
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="session not found or expired") from exc
+        except SessionForbiddenError as exc:
+            raise HTTPException(status_code=403, detail="session does not belong to this user") from exc
+        except SessionClosedError as exc:
+            raise HTTPException(status_code=409, detail="session cannot be closed") from exc
+        return _session_view(session)
+
+    @app.post("/v1/sessions/{session_id}/satisfaction", response_model=SessionView)
+    async def submit_satisfaction(
+        session_id: str,
+        payload: SatisfactionRequest,
+        request: Request,
+    ) -> SessionView:
+        try:
+            session = await _service(request).submit_satisfaction(payload, session_id)
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="session not found or expired") from exc
+        except SessionForbiddenError as exc:
+            raise HTTPException(status_code=403, detail="session does not belong to this user") from exc
+        except SatisfactionUnavailableError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="satisfaction is not available for this session",
+            ) from exc
+        return _session_view(session)
 
     return app
 
@@ -262,6 +312,46 @@ def _channel_dispatcher(request: Request) -> ChannelDispatcher:
 def _sse(event: str, data: dict) -> str:
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return f"event: {event}\ndata: {payload}\n\n"
+
+
+async def _lifecycle_sweeper(service: ChatService, interval_seconds: float) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            result = await service.sweep_lifecycle()
+            if result["idle_timeout"] or result["solved_timeout"]:
+                logger.info("lifecycle sweep closed sessions: %s", result)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("lifecycle sweep failed")
+
+
+def _session_view(session: SessionRecord) -> SessionView:
+    return SessionView(
+        session_id=session.id,
+        tenant_id=session.tenant_id,
+        user_id=session.user_id,
+        channel=session.channel,
+        status=session.status,
+        status_reason=session.status_reason,
+        turn_count=session.turn_count,
+        active_epoch=session.active_epoch,
+        messages=session.messages,
+        parent_session_id=session.parent_session_id,
+        reopened_count=session.reopened_count,
+        last_activity_at=session.last_activity_at,
+        solved_at=session.solved_at,
+        closed_at=session.closed_at,
+        close_reason=session.close_reason,
+        resolution_summary=session.resolution_summary,
+        handoff_requested_at=session.handoff_requested_at,
+        handoff_reason=session.handoff_reason,
+        satisfaction_prompted_at=session.satisfaction_prompted_at,
+        satisfaction=session.satisfaction,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+    )
 
 
 def _channel_response(payload: object, status_code: int, media_type: str) -> Response:

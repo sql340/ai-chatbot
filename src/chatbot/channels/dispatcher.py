@@ -4,6 +4,7 @@ import hashlib
 import logging
 
 from ..config import Settings
+from ..lifecycle import is_human_owned
 from ..models import ChatRequest, ChatResponse, OutboundItem
 from ..service import (
     AgentInvocationError,
@@ -80,6 +81,7 @@ class ChannelDispatcher:
 
         lock_id = self._conversation_lock_id(inbound)
         async with self.service.locks.acquire(inbound.tenant_id, lock_id):
+            parent_session_id: str | None = None
             session_id = await self.bindings.get(
                 inbound.tenant_id, inbound.channel, inbound.session_key
             )
@@ -93,8 +95,11 @@ class ChannelDispatcher:
                         inbound.tenant_id, inbound.channel, inbound.session_key
                     )
                 else:
-                    if session.status == "active" or not reset_closed:
+                    if is_human_owned(session.status):
                         return session.id
+                    if session.status != "closed" or not reset_closed:
+                        return session.id
+                    parent_session_id = session.id
                     await self.bindings.delete(
                         inbound.tenant_id, inbound.channel, inbound.session_key
                     )
@@ -103,6 +108,7 @@ class ChannelDispatcher:
                 tenant_id=inbound.tenant_id,
                 user_id=inbound.user_id,
                 channel=inbound.channel,
+                parent_session_id=parent_session_id,
             )
             await self.bindings.set(
                 inbound.tenant_id,
